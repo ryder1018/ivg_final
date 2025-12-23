@@ -27,6 +27,12 @@ from hloc import (
     reconstruction,
 )
 
+IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+
+
+def _is_image_file(path: Path) -> bool:
+    return path.suffix.casefold() in IMAGE_EXTS
+
 
 def lightglue_reconstruction_pipeline(
     image_dir: Path,
@@ -36,6 +42,7 @@ def lightglue_reconstruction_pipeline(
     num_matched: int = None,
     skip_nerf: bool = False,
     max_iterations: int = 30000,
+    enable_rich: bool = False,
 ):
     """
     Complete LightGlue + hloc + NeRF reconstruction pipeline
@@ -67,7 +74,7 @@ def lightglue_reconstruction_pipeline(
     image_list = sorted([
         p.relative_to(image_dir).as_posix() 
         for p in image_dir.iterdir() 
-        if p.suffix.lower() in ['.jpg', '.jpeg', '.png']
+        if _is_image_file(p)
     ])
     
     print(f"\n[1/4] Found {len(image_list)} images")
@@ -84,7 +91,15 @@ def lightglue_reconstruction_pipeline(
     
     # Step 2: Generate image pairs (exhaustive for dense reconstruction)
     print(f"\n[3/4] Generating image pairs...")
-    pairs_from_exhaustive.main(pairs_path, image_list=image_list)
+    if num_matched is None:
+        pairs_from_exhaustive.main(pairs_path, image_list=image_list)
+    else:
+        print(f"    Using sequential pairing: {num_matched} neighbors per image")
+        with open(pairs_path, "w") as f:
+            for i, name in enumerate(image_list):
+                for j in range(1, num_matched + 1):
+                    if i + j < len(image_list):
+                        f.write(f"{name} {image_list[i + j]}\n")
     
     # Count pairs
     with open(pairs_path, 'r') as f:
@@ -135,6 +150,7 @@ def lightglue_reconstruction_pipeline(
             colmap_dir=sfm_dir,  # Use sparse/ directly, not sparse/0
             output_dir=output_dir,
             max_iterations=max_iterations,
+            enable_rich=enable_rich,
         )
         
         if nerf_output:
@@ -188,33 +204,70 @@ def export_results(model, output_dir: Path):
     print(f"✓ Camera poses saved: {poses_path}")
 
 
-def train_nerf(image_dir: Path, colmap_dir: Path, output_dir: Path, max_iterations: int):
-    """Train NeRF using nerfstudio"""
+def train_nerf(
+    image_dir: Path,
+    colmap_dir: Path,
+    output_dir: Path,
+    max_iterations: int,
+    enable_rich: bool = False,
+):
+    """Train NeRF using nerfstudio (robust + log-to-file so Colab always shows progress)."""
+    import os
+    import shutil
+    from PIL import Image, ImageFile
+
+    ImageFile.LOAD_TRUNCATED_IMAGES = True  # ✅ tolerate truncated jpegs
+
+    def _ensure_downscaled_images(images_dir: Path, factor: int = 4, overwrite: bool = False):
+        ds_dir = images_dir.parent / f"images_{factor}"
+        ds_dir.mkdir(parents=True, exist_ok=True)
+
+        src_images = sorted([p for p in images_dir.iterdir() if _is_image_file(p)])
+        dst_images = sorted([p for p in ds_dir.iterdir() if _is_image_file(p)])
+
+        if not overwrite and len(src_images) > 0 and len(dst_images) == len(src_images):
+            print(f"✓ Downscaled images already exist: {ds_dir}")
+            return
+
+        if overwrite:
+            for p in ds_dir.iterdir():
+                if p.is_file():
+                    p.unlink()
+
+        ok = 0
+        for src in tqdm(src_images, desc=f"Downscaling x{factor}"):
+            try:
+                with Image.open(src) as img:
+                    img = img.convert("RGB")
+                    w, h = img.size
+                    nw, nh = max(1, w // factor), max(1, h // factor)
+                    img = img.resize((nw, nh), resample=Image.BILINEAR)
+                    img.save(ds_dir / (src.stem + ".jpg"), quality=95)
+                ok += 1
+            except Exception as e:
+                print(f"[WARN] skip bad image: {src.name} ({e})")
+        print(f"✓ Created downscaled images: {ds_dir} ({ok}/{len(src_images)} ok)")
+
     nerf_output = output_dir / "nerf"
-    
-    # Prepare data directory
     data_dir = output_dir / "nerfstudio_data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    
+
     print("\n[1/2] Preparing data for NeRF...")
-    
-    # Copy images
-    import shutil
+
     images_dest = data_dir / "images"
     if images_dest.exists():
         shutil.rmtree(images_dest)
     shutil.copytree(image_dir, images_dest)
-    
-    # Copy COLMAP results (nerfstudio expects colmap/sparse/0)
+
+    downscale_factor = 4
+    _ensure_downscaled_images(images_dest, factor=downscale_factor, overwrite=False)
+
     colmap_dest = data_dir / "colmap" / "sparse" / "0"
     colmap_dest.parent.parent.mkdir(parents=True, exist_ok=True)
     if colmap_dest.exists():
         shutil.rmtree(colmap_dest)
-    
-    # Detect COLMAP directory structure
-    # hloc outputs to sparse/models/0/, but bin files may be in sparse/ root
+
     if list(colmap_dir.glob("*.bin")):
-        # Bin files are directly in colmap_dir
         actual_colmap_dir = colmap_dir
     elif (colmap_dir / "0").exists() and list((colmap_dir / "0").glob("*.bin")):
         actual_colmap_dir = colmap_dir / "0"
@@ -222,19 +275,16 @@ def train_nerf(image_dir: Path, colmap_dir: Path, output_dir: Path, max_iteratio
         actual_colmap_dir = colmap_dir / "models" / "0"
     else:
         raise FileNotFoundError(f"Cannot find COLMAP bin files in {colmap_dir}")
-    
-    print(f"Copying COLMAP from: {actual_colmap_dir}")
+
     colmap_dest.mkdir(parents=True, exist_ok=True)
-    
-    # Copy only the necessary bin files
-    for bin_file in ['cameras.bin', 'images.bin', 'points3D.bin', 'frames.bin', 'rigs.bin']:
-        src = actual_colmap_dir / bin_file
-        if src.exists():
-            shutil.copy2(src, colmap_dest / bin_file)
-    
+    for name in ["cameras.bin", "images.bin", "points3D.bin"]:
+        src = actual_colmap_dir / name
+        if not src.exists():
+            raise FileNotFoundError(f"Missing required COLMAP file: {src}")
+        shutil.copy2(src, colmap_dest / name)
+
     print("✓ Data prepared")
-    
-    # Train NeRF
+
     print(f"\n[2/2] Training NeRF ({max_iterations} iterations)...")
     cmd = [
         "ns-train", "nerfacto",
@@ -243,38 +293,64 @@ def train_nerf(image_dir: Path, colmap_dir: Path, output_dir: Path, max_iteratio
         "colmap",
         "--data", str(data_dir),
         "--auto-scale-poses", "True",
-        "--downscale-factor", "4",
+        "--downscale-factor", str(downscale_factor),
     ]
-    
-    print(f"Running: {' '.join(cmd)}\n")
-    print("📊 NeRF训练进度（实时显示）：")
-    print("="*70)
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    if not enable_rich:
+        env["RICH_DISABLE"] = "1"
+
+    log_path = output_dir / "ns_train.log"
+    print(f"Running: {' '.join(cmd)}")
+    print(f"Logging to: {log_path}")
+
     try:
-        # 直接显示到终端，不捕获输出
-        subprocess.run(cmd, check=True)
+        with open(log_path, "w") as f:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                text=True,
+                bufsize=1,
+            )
+            # ✅ 一邊印到 Colab output，一邊寫檔
+            for line in proc.stdout:
+                print(line, end="")
+                f.write(line)
+                f.flush()
+                sys.stdout.flush()
+            ret = proc.wait()
+            if ret != 0:
+                raise subprocess.CalledProcessError(ret, cmd)
+
         print(f"\n✓ NeRF training complete: {nerf_output}")
         return nerf_output
+
     except subprocess.CalledProcessError as e:
         print(f"\n✗ NeRF training failed: {e}")
+        print(f"Check log: {log_path}")
         return None
 
 
+
+
 def export_nerf_outputs(nerf_output: Path, output_dir: Path):
-    """Export NeRF dense point cloud and depth maps"""
     print("\n" + "="*70)
     print("Exporting NeRF Dense Reconstruction")
     print("="*70)
-    
-    # Find trained model
-    model_dirs = list(nerf_output.glob("nerfacto/*/"))
-    if not model_dirs:
-        print("Warning: No trained NeRF model found")
+
+    configs = list(nerf_output.rglob("config.yml"))
+    if not configs:
+        print("Warning: No config.yml found under nerf output. NeRF might not have finished.")
         return
-    
-    latest_model = sorted(model_dirs)[-1]
-    config_path = latest_model / "config.yml"
-    
-    # Export dense point cloud (1M points)
+
+    config_path = max(configs, key=lambda p: p.stat().st_mtime)
+    print(f"Using config: {config_path}")
+
+    # Export dense point cloud
     print("\n[1/2] Exporting dense point cloud (1M points)...")
     cmd = [
         "ns-export", "pointcloud",
@@ -284,12 +360,9 @@ def export_nerf_outputs(nerf_output: Path, output_dir: Path):
         "--remove-outliers", "True",
         "--use-bounding-box", "True",
     ]
-    try:
-        subprocess.run(cmd, check=True)
-        print(f"✓ Dense point cloud exported: {output_dir / 'point_cloud.ply'}")
-    except subprocess.CalledProcessError as e:
-        print(f"✗ Point cloud export failed: {e}")
-    
+    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
+    print(f"✓ Dense point cloud exported: {output_dir / 'point_cloud.ply'}")
+
     # Export depth maps
     print("\n[2/2] Exporting depth maps...")
     depth_output = output_dir / "depth_maps"
@@ -300,11 +373,9 @@ def export_nerf_outputs(nerf_output: Path, output_dir: Path):
         "--output-path", str(depth_output),
         "--rendered-output-names", "depth",
     ]
-    try:
-        subprocess.run(cmd, check=True)
-        print(f"✓ Depth maps exported: {depth_output}")
-    except subprocess.CalledProcessError as e:
-        print(f"✗ Depth map export failed: {e}")
+    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
+    print(f"✓ Depth maps exported: {depth_output}")
+
 
 
 def main():
@@ -338,6 +409,12 @@ def main():
         help="Feature matcher type (must match feature_type)"
     )
     parser.add_argument(
+        "--num_matched",
+        type=int,
+        default=None,
+        help="Limit pairs per image (sequential). If set, overrides exhaustive pairing",
+    )
+    parser.add_argument(
         "--skip_nerf",
         action="store_true",
         help="Skip NeRF training, only do SfM"
@@ -347,6 +424,11 @@ def main():
         type=int,
         default=30000,
         help="Max NeRF training iterations (default: 30000)"
+    )
+    parser.add_argument(
+        "--enable_rich",
+        action="store_true",
+        help="Enable rich progress bars for nerfstudio (helpful in Colab)",
     )
     
     args = parser.parse_args()
@@ -361,8 +443,10 @@ def main():
         output_dir=args.output_dir,
         feature_type=args.feature_type,
         matcher_type=args.matcher_type,
+        num_matched=args.num_matched,
         skip_nerf=args.skip_nerf,
         max_iterations=args.max_iterations,
+        enable_rich=args.enable_rich,
     )
     
     # Print final summary
